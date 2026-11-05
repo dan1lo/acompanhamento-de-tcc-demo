@@ -1,0 +1,305 @@
+// Modelo de dados — ver seção 4 do documento de requisitos.
+//
+// Extensões sobre o rascunho original:
+// - Professor é uma única tabela (mesma pessoa pode ser RESPONSAVEL numa turma e ORIENTADOR
+//   noutra) associada à Turma via TurmaProfessor com um papel.
+// - Aluno.orientadorId é o vínculo ATUAL; trocas de orientador ficam registradas em
+//   AlocacaoHistorico em vez de sobrescrever sem rastro.
+// - RelatorioSemanal nunca é sobrescrito por número de relatório repetido dentro do MESMO
+//   upload; um novo envio do mesmo numero_relatorio substitui o conteúdo, mas cada
+//   numero_relatorio é sua própria linha de histórico.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+enum Papel {
+  RESPONSAVEL
+  ORIENTADOR
+}
+
+model Coordenador {
+  id     String  @id @default(cuid())
+  nome   String
+  email  String  @unique
+  // Hash bcrypt — null enquanto ninguém (a própria pessoa ou um admin) configurou uma senha
+  // pra essa conta. Sem senha configurada, login por e-mail/senha não é possível pra ela; ela
+  // continua entrando pela lista "sem senha" (ver login/page.tsx) até alguém configurar uma.
+  senhaHash String?
+  // Uma pessoa pode ser Professor E Coordenador ao mesmo tempo (ex.: orienta numa turma e
+  // coordena outra) — esse vínculo opcional aponta pro MESMO login de Professor dela, em vez de
+  // duplicar conta. Sem vínculo (null) = coordenador "puro", sem nenhum papel de professor,
+  // login e senha inteiramente próprios.
+  professorId String? @unique
+  professor   Professor? @relation(fields: [professorId], references: [id])
+  // Turma.coordenadorId é o coordenador "principal" (legado, ainda usado no formulário de
+  // Dados da turma). TurmaCoordenador é a lista completa — pode ter mais de um coordenador
+  // acompanhando a mesma turma (ver adicionarCoordenador em configActions.ts).
+  turmas Turma[]
+  turmasVinculadas TurmaCoordenador[]
+}
+
+model Professor {
+  id    String  @id @default(cuid())
+  nome  String
+  email String? @unique
+  // Mesma regra do Coordenador.senhaHash acima — hash bcrypt, null até alguém configurar.
+  senhaHash String?
+  // true = essa conta também abre o painel de admin (/admin), além de tudo que já tem por
+  // TurmaProfessor. Não é uma conta separada — é a MESMA conta de Professor com um poder a
+  // mais, pra não obrigar uma pessoa que é professor E admin a ter dois logins diferentes.
+  isAdmin Boolean @default(false)
+
+  vinculos      TurmaProfessor[]
+  alunos        Aluno[]          @relation("AlunoOrientador")
+  observacoes   Observacao[]
+  alocacoes     AlocacaoHistorico[]
+  uploads       UploadLog[]
+  // Ver Coordenador.professorId acima — presente só se essa pessoa também for coordenadora.
+  coordenadorVinculado Coordenador?
+}
+
+model Turma {
+  id             String   @id @default(cuid())
+  nome           String
+  periodoLetivo  String
+  disciplina     String
+  coordenadorId  String?
+  coordenador    Coordenador? @relation(fields: [coordenadorId], references: [id])
+
+  // Limite de faltas da disciplina — atingir esse número é reprovação (vermelho).
+  limiteFaltas Int @default(14)
+
+  // Quantas faltas "de folga" antes do limite já contam como alerta (amarelo). Ex.: limite 11,
+  // buffer 3 → amarelo a partir de 8 faltas.
+  bufferAmarelo Int @default(3)
+
+  // Nº de ciclos seguidos com falta que já é considerado alerta (amarelo), mesmo longe do limite
+  // numérico — é um sinal de padrão de risco, não de reprovação ainda.
+  faltasConsecutivasAlerta Int @default(2)
+
+  // Apesar do nome, é o peso da nota da pessoa ORIENTADORA (0.6 = 60%) — o resto vai pra nota
+  // automática de presença. Nome mantido pra não exigir migração; ver computeNotaFinal (lib/notas.ts).
+  pesoNotaAutomatica Float @default(0.60)
+
+  // numeroCiclo do último ciclo que conta pra nota automática da SR1 — a contagem de faltas
+  // reinicia do zero pra SR2 a partir do ciclo seguinte. null = ainda não definido (SR1 conta
+  // tudo até agora, SR2 fica sem nenhum ciclo pra contar). Ver computeNotaAutomaticaPorPeriodo.
+  cicloCorteSR1 Int?
+
+  // Controlado só pelo RESPONSAVEL da disciplina: enquanto false, a pessoa orientadora não
+  // consegue lançar/editar a própria nota daquele período (nem pela UI nem direto na action) —
+  // fica travado até o responsável liberar. Default false: fechado até alguém abrir de propósito.
+  notasSR1Liberadas Boolean @default(false)
+  notasSR2Liberadas Boolean @default(false)
+
+  // Turma arquivada some da visão de quem é RESPONSAVEL/orientador/coordenador vinculado — só a
+  // coordenação da turma continua enxergando (pra poder restaurar). Não apaga nada, só marca
+  // quando foi arquivada; null = ativa.
+  arquivadaEm DateTime?
+
+  createdAt DateTime @default(now())
+
+  vinculos     TurmaProfessor[]
+  coordenadores TurmaCoordenador[]
+  alunos       Aluno[]
+  ciclos       CicloData[]
+  uploads      UploadLog[]
+}
+
+model TurmaCoordenador {
+  id            String @id @default(cuid())
+  turmaId       String
+  coordenadorId String
+
+  turma       Turma       @relation(fields: [turmaId], references: [id], onDelete: Cascade)
+  coordenador Coordenador @relation(fields: [coordenadorId], references: [id], onDelete: Cascade)
+
+  @@unique([turmaId, coordenadorId])
+}
+
+model TurmaProfessor {
+  id          String    @id @default(cuid())
+  turmaId     String
+  professorId String
+  papel       Papel
+  // Só usado quando papel=RESPONSAVEL: lista JSON de grupos (ex.: ["Grupo 01","Grupo 02"]) que
+  // essa pessoa responsável enxerga no dashboard da turma. null/vazio = vê todos os alunos
+  // (comportamento de antes desse campo existir).
+  gruposResponsavel String?
+
+  turma     Turma     @relation(fields: [turmaId], references: [id], onDelete: Cascade)
+  professor Professor @relation(fields: [professorId], references: [id], onDelete: Cascade)
+
+  @@unique([turmaId, professorId, papel])
+}
+
+model CicloData {
+  // Substitui as colunas de data fixas da planilha. numeroCiclo corresponde 1:1 ao
+  // numeroRelatorio esperado nesse ciclo.
+  id           String   @id @default(cuid())
+  turmaId      String
+  numeroCiclo  Int
+  dataPrevista DateTime
+
+  // true = semana sem encontro previsto pra ninguém (feriado, data de prova, etc.) — o
+  // relatório não é exigido e a semana não conta pra falta nem pro cálculo de % de entrega.
+  semEncontro Boolean @default(false)
+
+  // JSON com os nomes canônicos de grupo que têm reunião prevista nesse ciclo (ex.:
+  // '["Grupo 01","Grupo 03"]'), '["TODOS"]' pra semana de todo mundo, ou '[]' quando
+  // semEncontro=true. Alunos fora desses grupos ainda precisam mandar o relatório da semana,
+  // só não têm reunião prevista.
+  gruposComReuniao String @default("[]")
+
+  // Override manual do número de relatório esperado nesse ciclo — normalmente o número é contado
+  // automaticamente (1º ciclo que conta = relatório 1, 2º = relatório 2, ...), mas quando o
+  // calendário muda no meio do período (ex.: uma reunião extra é adicionada) e os alunos já
+  // numeraram os relatórios deles pelo esquema antigo (e não têm como corrigir a resposta
+  // enviada), esse campo realinha a contagem a partir deste ciclo — os ciclos seguintes continuam
+  // a numeração a partir daqui, sem precisar de um override em cada um. Ver `indiceDoCicloMap`.
+  numeroRelatorioManual Int?
+
+  turma Turma @relation(fields: [turmaId], references: [id], onDelete: Cascade)
+
+  @@unique([turmaId, numeroCiclo])
+}
+
+model Aluno {
+  id               String  @id @default(cuid())
+  nome             String
+  nomeNormalizado  String
+  email            String?
+  turmaId          String
+  orientadorId     String?
+  tituloTcc        String?
+  ativo            Boolean @default(true)
+  // Nome canônico do grupo de atendimento quinzenal (ex.: "Grupo 01") — atribuído ao importar
+  // a planilha de agenda. Determina em quais ciclos o aluno tem reunião prevista.
+  grupo            String?
+  // Horário fixo de atendimento (ex.: "13:30 - 13:40") e ordem no dia — também vêm da agenda,
+  // usados pra ordenar a lista de alunos na tela de Reuniões.
+  horarioReuniao   String?
+  ordemSlot        Int?
+
+  turma      Turma      @relation(fields: [turmaId], references: [id], onDelete: Cascade)
+  orientador Professor? @relation("AlunoOrientador", fields: [orientadorId], references: [id])
+
+  relatorios  RelatorioSemanal[]
+  observacoes Observacao[]
+  notas       Nota[]
+  alocacoes   AlocacaoHistorico[]
+
+  @@index([turmaId, nomeNormalizado])
+}
+
+model AlocacaoHistorico {
+  // Histórico de reatribuição de orientador — nunca apagado.
+  id           String    @id @default(cuid())
+  alunoId      String
+  orientadorId String?
+  inicio       DateTime  @default(now())
+  fim          DateTime?
+
+  aluno      Aluno      @relation(fields: [alunoId], references: [id], onDelete: Cascade)
+  orientador Professor? @relation(fields: [orientadorId], references: [id])
+}
+
+model RelatorioSemanal {
+  id                 String    @id @default(cuid())
+  alunoId            String
+  numeroRelatorio    Float
+  timestampEnvio     DateTime
+  // true só quando veio de um envio real do Forms (uploadRelatorios) — uma linha criada só pra
+  // marcar presença na tela de Reuniões (salvarRelatorioReuniao), sem o aluno ter mandado nada,
+  // fica false. Necessário pra distinguir "faltou o relatório" de "faltou a reunião" (ver
+  // semaforo.ts) quando só um dos dois aconteceu.
+  relatorioEntregue  Boolean   @default(false)
+  cronogramaEmDia    Boolean?
+  // Auto-relatado pelo PRÓPRIO ALUNO no Forms semanal — se ele teve reunião com a pessoa
+  // ORIENTADORA (1:1) naquela semana. NÃO é presença na reunião quinzenal da disciplina (ver
+  // `presencaReuniaoDisciplina`) — são dois eventos independentes, um pode acontecer sem o
+  // outro nos dois sentidos. Nunca usar esse campo no cálculo de falta/nota.
+  teveReuniao        Boolean?
+  dataUltimaReuniao  DateTime?
+  // Presença do aluno na reunião quinzenal DA DISCIPLINA (por grupo, ver CicloData) — controlado
+  // manualmente pelo professor/orientador na tela de Reuniões (salvarRelatorioReuniao), nunca
+  // pelo upload do Forms. É este campo (não `teveReuniao`) que entra no cálculo de falta e nota
+  // automática (ver semaforo.ts) — um aluno pode se reunir com a pessoa orientadora e mesmo assim
+  // faltar à reunião da disciplina, ou vice-versa.
+  presencaReuniaoDisciplina Boolean?
+  impedimento        Boolean   @default(false)
+  impedimentoDesc    String?
+  // true = o RESPONSAVEL escondeu a descrição do impedimento da pessoa orientadora (ex.: aluno
+  // relatou algo sensível sobre ela) — a pessoa RESPONSAVEL, outros RESPONSAVEL e a coordenação
+  // continuam vendo normalmente. O fato de "tem impedimento" (o badge) continua igual pra todo
+  // mundo; só o texto da descrição fica oculto.
+  impedimentoOcultoDoOrientador Boolean @default(false)
+  oQueFez            String?
+  oQuePretende       String?
+  linkCronograma     String?
+  orientadorDeclarado String?  // nome como veio do formulário, p/ validação cruzada
+
+  aluno Aluno @relation(fields: [alunoId], references: [id], onDelete: Cascade)
+
+  @@unique([alunoId, numeroRelatorio])
+}
+
+enum SituacaoOrientacao {
+  OK
+  ATENCAO
+  INTERVENCAO
+}
+
+model Observacao {
+  id          String   @id @default(cuid())
+  alunoId     String
+  professorId String
+  data        DateTime @default(now())
+  texto       String
+  // Só preenchido em reuniões formais registradas pela própria pessoa orientadora do aluno
+  // (ver registrarSituacaoOrientador) — observações de texto livre (do RESPONSAVEL, ou notas
+  // soltas do orientador) deixam isso null.
+  situacao    SituacaoOrientacao?
+  // true = o RESPONSAVEL escondeu essa observação da pessoa orientadora (ex.: o aluno falou algo
+  // sensível sobre ela) — só pra observações escritas por um RESPONSAVEL; RESPONSAVEL e
+  // coordenação sempre veem tudo.
+  ocultoDoOrientador Boolean @default(false)
+
+  aluno     Aluno     @relation(fields: [alunoId], references: [id], onDelete: Cascade)
+  professor Professor @relation(fields: [professorId], references: [id])
+}
+
+model Nota {
+  id             String  @id @default(cuid())
+  alunoId        String
+  periodo        String  // "SR1" | "SR2" etc — poderia virar configurável por turma no futuro
+  notaAutomatica Float?
+  notaOrientador Float?
+  notaFinal      Float?
+  comentario     String?
+
+  aluno Aluno @relation(fields: [alunoId], references: [id], onDelete: Cascade)
+
+  @@unique([alunoId, periodo])
+}
+
+model UploadLog {
+  // Auditoria mínima de upload: quem, quando, quantos registros afetou.
+  id                String   @id @default(cuid())
+  turmaId           String
+  tipo              String   // "roster" | "relatorios"
+  nomeArquivo       String
+  timestamp         DateTime @default(now())
+  registrosAfetados Int      @default(0)
+  professorId       String?
+  resumoJson        String?  // JSON serializado com detalhes: casados/sem correspondência
+
+  turma     Turma      @relation(fields: [turmaId], references: [id], onDelete: Cascade)
+  professor Professor? @relation(fields: [professorId], references: [id])
+}
